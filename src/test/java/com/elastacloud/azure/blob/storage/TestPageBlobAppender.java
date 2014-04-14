@@ -68,7 +68,7 @@ public class TestPageBlobAppender {
     @Test
     public void TestPageBlobAppender_Test_BufferIsAligned() throws URISyntaxException, StorageException {
         PowerMockito.spy(PageBlobAppender.class);
-        PowerMockito.doCallRealMethod().when( )
+     //   PowerMockito.doCallRealMethod().when( )
 
     }
 }
