@@ -21,7 +21,7 @@ log4j.appender.blobappender.layout.ConversionPattern=%d{yy/MM/dd HH:mm:ss} %p %c
 
 Replace 
 
-'''%connectionString%''' and '''%container%''' as appropriate
+<b>%connectionString%'</b> and '''%container%''' as appropriate
 '''fileSize''' - is a configurable max file size in bytes for a log file NOTE: azure reserves the entire amount, when the logging of a message exceeds the max the file is automatically rolled over.
 '''logFileDatePattern''' - date pattern for the log file name
 '''logFileName''' - NOTE %h = hostname, %d = date formatted according to the pattern specified in logFileDatePattern
