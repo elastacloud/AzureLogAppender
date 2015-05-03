@@ -1,219 +1,236 @@
 package com.elastacloud.azure.blob.storage;
 
-import com.microsoft.windowsazure.services.blob.client.*;
-import com.microsoft.windowsazure.services.core.storage.CloudStorageAccount;
-import com.microsoft.windowsazure.services.core.storage.StorageException;
-import org.apache.commons.lang3.ArrayUtils;
-
-import java.io.*;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.URISyntaxException;
 import java.util.Arrays;
 import java.util.List;
+
+import org.apache.commons.lang3.ArrayUtils;
+
+import com.microsoft.azure.storage.CloudStorageAccount;
+import com.microsoft.azure.storage.StorageException;
+import com.microsoft.azure.storage.blob.CloudBlobClient;
+import com.microsoft.azure.storage.blob.CloudBlobContainer;
+import com.microsoft.azure.storage.blob.CloudPageBlob;
+import com.microsoft.azure.storage.blob.CopyStatus;
+import com.microsoft.azure.storage.blob.PageRange;
 
 /**
  * Created by david on 10/04/14.
  */
 public class PageBlobAppender {
 
+	private CloudBlobContainer blobcontainer = null;
+	private String logFileName = "";
+	private int maxSize = 0;
+	private final int PAGE_SIZE_MULTIPLE = 512;
 
+	private int fileSuffix = 0;
+	private List<PageRange> pages = null;
 
-    private CloudBlobContainer blobcontainer = null;
-    private String logFileName = "";
-    private int maxSize  = 0;
-    private final int PAGE_SIZE_MULTIPLE = 512;
+	private CloudStorageAccount storageAccount = null;
 
-    private int fileSuffix = 0;
-    private List<PageRange> pages = null;
+	private CloudPageBlob blob = null;
+	private CloudBlobClient blobClient = null;
 
-    private CloudStorageAccount storageAccount = null;
+	private String message = null;
 
+	private long writeOffset = 0;
 
+	/*
+	 * Constructor
+	 */
+	public PageBlobAppender() {
 
-    private CloudPageBlob blob = null;
-    private CloudBlobClient blobClient = null;
+	}
 
-    private String message = null;
+	public PageBlobAppender(CloudStorageAccount storageAccount) {
+		this.storageAccount = storageAccount;
+	}
 
-    private long writeOffset = 0;
+	private void appendToBlob() throws IOException, StorageException {
+		// get a stream
+		byte[] buffer = getAlignedBuffer(this.message.getBytes());
+		InputStream inStream = new ByteArrayInputStream(buffer);
 
-    public void setMaxSize(int maxSize) {
-        this.maxSize = maxSize;
-    }
+		// write the data
+		this.blob.uploadPages(inStream, this.writeOffset, buffer.length);
+	}
 
-    /*
-    Constructor
-     */
-    public PageBlobAppender()
-    {
+	/*
+	 * Determines whether log file rollover is required based on the current last written point and the length of hte message in bytes
+	 *
+	 * @param fileSize - last written location in the file
+	 *
+	 * @param currentMessage - the current message to write
+	 */
+	private void checkRollover() throws URISyntaxException, StorageException {
 
-    }
+		if (this.pages != null && this.pages.size() > 0 && this.pages.get(this.pages.size() - 1).getEndOffset() + this.message.getBytes().length > this.maxSize) {
+			// rename
+			rename();
 
-    public PageBlobAppender(CloudStorageAccount storageAccount)
-    {
-        this.storageAccount = storageAccount;
-    }
+			// recreate log file
+			initBlob();
+		}
+	}
 
-    public void getBlobReference(String connectionString, String containerName) throws Exception
-    {
-        this.storageAccount = CloudStorageAccount.parse(connectionString);
-        this.blobClient = storageAccount.createCloudBlobClient();
-        this.blobcontainer = blobClient.getContainerReference(containerName);
-    }
+	private void deriveWriteOffset() throws StorageException {
+		// check to see if we can append to the current page, if a page exists
+		if (this.pages.size() > 0) {
+			// get the most recent page
+			PageRange lastPage = this.pages.get(this.pages.size() - 1);
 
-    /*
-    Returns a new instance of the source aligned to 512 bytes
-    @param source - the byte array source
-     */
-    private byte[] getAlignedBuffer(byte[] source)
-    {
-        int remainder = source.length%PAGE_SIZE_MULTIPLE;
-        int size = source.length;
-        if(remainder > 0)
-            size += PAGE_SIZE_MULTIPLE - remainder;
+			// get the last page and download the last 512 bytes
+			byte[] buf = new byte[this.PAGE_SIZE_MULTIPLE];
 
-        byte[] buffer = Arrays.copyOf(ArrayUtils.EMPTY_BYTE_ARRAY, size);
-        Arrays.fill(buffer, (byte)0);
-        System.arraycopy(source, 0, buffer, 0, source.length);
+			this.blob.downloadRangeToByteArray(lastPage.getEndOffset() - this.PAGE_SIZE_MULTIPLE + 1, (long) this.PAGE_SIZE_MULTIPLE, buf, 0);
 
-        return buffer;
-    }
+			// find the first null reference in the file
+			String str = new String(buf);
+			int index = str.indexOf((byte) 0);
 
-    /*
-    Determines whether log file rollover is required based on the current last written point and the length of hte message in bytes
-    @param fileSize - last written location in the file
-    @param currentMessage - the current message to write
-     */
-    private void checkRollover() throws URISyntaxException, StorageException {
+			// we have found a null
+			if (index > 0) {
+				// strip off any null characters
+				String subStr = str.substring(0, str.indexOf((byte) 0));
 
-        if(pages != null && pages.size() > 0 && (pages.get(pages.size()-1).getEndOffset() + this.message.getBytes().length) > maxSize)
-        {
-            //rename
-            rename();
+				// append the message
+				this.message = subStr + this.message;
 
-            //recreate log file
-            initBlob();
-        }
-    }
+				// set the write offset to be the start of the 512 bytes we downloaded
+				this.writeOffset = lastPage.getEndOffset() - this.PAGE_SIZE_MULTIPLE + 1;
+			} else {
+				// otherwise write at the end of the last 512 bytes
+				this.writeOffset = lastPage.getEndOffset() + 1;
+			}
+		}
+	}
 
-    private void deriveWriteOffset() throws StorageException {
-        //check to see if we can append to the current page, if a page exists
-        if(pages.size() > 0)
-        {
-            //get the most recent page
-            PageRange lastPage = pages.get(pages.size()-1);
+	/*
+	 * Returns a new instance of the source aligned to 512 bytes
+	 *
+	 * @param source - the byte array source
+	 */
+	private byte[] getAlignedBuffer(byte[] source) {
+		int remainder = source.length % this.PAGE_SIZE_MULTIPLE;
+		int size = source.length;
+		if (remainder > 0) {
+			size += this.PAGE_SIZE_MULTIPLE - remainder;
+		}
 
-            //get the last page and download the last 512 bytes
-            byte[] buf = new byte[PAGE_SIZE_MULTIPLE];
-            blob.downloadRange(lastPage.getEndOffset() -PAGE_SIZE_MULTIPLE+1, PAGE_SIZE_MULTIPLE, buf, 0);
+		byte[] buffer = Arrays.copyOf(ArrayUtils.EMPTY_BYTE_ARRAY, size);
+		Arrays.fill(buffer, (byte) 0);
+		System.arraycopy(source, 0, buffer, 0, source.length);
 
-            //find the first null reference in the file
-            String str = new String(buf);
-            int index = str.indexOf((byte) 0);
+		return buffer;
+	}
 
-            //we have found a null
-            if(index > 0)
-            {
-                //strip off any null characters
-                String subStr = str.substring(0, str.indexOf((byte)0));
+	public void getBlobReference(String connectionString, String containerName) throws Exception {
+		this.storageAccount = CloudStorageAccount.parse(connectionString);
+		this.blobClient = this.storageAccount.createCloudBlobClient();
+		this.blobcontainer = this.blobClient.getContainerReference(containerName);
+	}
 
-                //append the message
-                this.message = subStr + message;
+	private void initBlob() throws URISyntaxException, StorageException {
+		// get a reference to the blob
+		this.blob = this.blobcontainer.getPageBlobReference(this.logFileName);
 
-                //set the write offset to be the start of the 512 bytes we downloaded
-                this.writeOffset =  lastPage.getEndOffset() -PAGE_SIZE_MULTIPLE+1;
-            }
-            else
-            {
-                //otherwise write at the end of the last 512 bytes
-                this.writeOffset =  lastPage.getEndOffset() +1;
-            }
-        }
-    }
+		// create if not exists, we have to reserve the file size
+		// TODO: find way to grow file if necessary
+		if (!this.blob.exists()) {
+			this.blob.create(this.maxSize);
+		}
 
-    /*
-    renames the blob
-    @param blob - the blob to rename
-     */
-    public Boolean rename() throws URISyntaxException, StorageException {
-        CloudPageBlob newBlob = blobcontainer.getPageBlobReference(this.logFileName + fileSuffix);
-        if(!newBlob.exists())
-            newBlob.create(maxSize);
-        newBlob.copyFromBlob(this.blob);
-        blob.delete();
-        fileSuffix +=1;
-        return true;
-    }
+		// check for rename if writing an additional message would cause max size to be exceeded
+		this.pages = this.blob.downloadPageRanges();
+		this.writeOffset = 0;
+	}
 
-    private void initBlob() throws URISyntaxException, StorageException {
-        //get a reference to the blob
-        this.blob = blobcontainer.getPageBlobReference(this.logFileName);
+	/*
+	 * appends a log message to a blob
+	 */
+	public Boolean log(String message) throws Exception {
 
-        //create if not exists, we have to reserve the file size
-        //TODO: find way to grow file if necessary
-        if(!blob.exists())
-            blob.create(this.maxSize);
+		this.setMessage(message);
 
-        //check for rename if writing an additional message would cause max size to be exceeded
-        this.pages = blob.downloadPageRanges();
-        this.writeOffset = 0;
-    }
+		// initialise the blob (creates only if required
+		initBlob();
 
-    private void appendToBlob() throws IOException, StorageException {
-        //get a stream
-        byte[] buffer = getAlignedBuffer(this.message.getBytes());
-        InputStream inStream = new ByteArrayInputStream(buffer);
+		// check if rollover is required
+		checkRollover();
 
-        //write the data
-        blob.uploadPages(inStream, this.writeOffset, (long) buffer.length);
-    }
-    /*
-    appends a log message to a blob
-     */
-    public Boolean log(String message) throws Exception {
+		// get the write offset
+		deriveWriteOffset();
 
-        this.setMessage(message);
+		// update the blob
+		appendToBlob();
 
-        //initialise the blob (creates only if required
-        initBlob();
+		return true;
+	}
 
-        //check if rollover is required
-        checkRollover();
+	/*
+	 * renames the blob
+	 *
+	 * @param blob - the blob to rename
+	 */
+	public Boolean rename() throws URISyntaxException, StorageException {
+		CloudPageBlob newBlob = this.blobcontainer.getPageBlobReference(this.logFileName + this.fileSuffix);
+		if (!newBlob.exists()) {
+			newBlob.create(this.maxSize);
+		}
+		newBlob.startCopyFromBlob(this.blob);
+		while (newBlob.getCopyState().getStatus() == CopyStatus.PENDING) {
+			try {
+				Thread.sleep(250);
+			} catch (InterruptedException e) {
+				return false;
+			}
+		}
+		if (newBlob.getCopyState().getStatus() != CopyStatus.SUCCESS) {
+			return false;
+		} else {
+			this.blob.delete();
+		}
+		this.fileSuffix += 1;
+		return true;
+	}
 
-        //get the write offset
-        deriveWriteOffset();
+	public void setBlob(CloudPageBlob blob) {
+		this.blob = blob;
+	}
 
-        //update the blob
-        appendToBlob();
+	public void setBlobcontainer(CloudBlobContainer blobcontainer) {
+		this.blobcontainer = blobcontainer;
+	}
 
-        return true;
-    }
+	public void setFileSuffix(int fileSuffix) {
+		this.fileSuffix = fileSuffix;
+	}
 
-    public void setMessage(String message) throws Exception {
-        if(message == null)
-            throw new Exception("Cannot log null message");
-        //ensure the line ends with a carriage return
-        if(message != null && !message.endsWith("\n"))
-            this.message = message + "\n";
-        else
-            this.message = message;
-    }
+	public void setLogFileName(String filename) throws Exception {
+		if (filename == null || "".equals(filename)) {
+			throw new Exception("Cannot write to unspecified file");
+		}
 
-    public void setLogFileName(String filename) throws Exception {
-        if(filename == null || "".equals(filename))
-            throw new Exception("Cannot write to unspecified file");
+		this.logFileName = filename;
+	}
 
-        this.logFileName = filename;
-    }
+	public void setMaxSize(int maxSize) {
+		this.maxSize = maxSize;
+	}
 
-    public void setFileSuffix(int fileSuffix) {
-        this.fileSuffix = fileSuffix;
-    }
-
-    public void setBlobcontainer(CloudBlobContainer blobcontainer) {
-        this.blobcontainer = blobcontainer;
-    }
-
-    public void setBlob(CloudPageBlob blob) {
-        this.blob = blob;
-    }
+	public void setMessage(String message) throws Exception {
+		if (message == null) {
+			throw new Exception("Cannot log null message");
+		}
+		// ensure the line ends with a carriage return
+		if (message != null && !message.endsWith("\n")) {
+			this.message = message + "\n";
+		} else {
+			this.message = message;
+		}
+	}
 }
